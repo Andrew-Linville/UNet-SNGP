@@ -1,0 +1,10 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+-e .
+numpy<2.0
+albumentations
+matplotlib
+Pillow
+pycocotools
+torch==2.3.0+cu121
+torchvision==0.18.0
+tqdm
