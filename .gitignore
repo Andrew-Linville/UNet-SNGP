@@ -9,7 +9,9 @@ checkpoints/
 arc_venvs/
 logs/
 losses.csv/
-
+val_channel_masks/
+val_mask_overlays/
+val_variance_maps/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

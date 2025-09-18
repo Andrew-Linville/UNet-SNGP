@@ -246,7 +246,7 @@ def _test():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     x = torch.randn(2, 1, 160, 160, device=device)
     K = 2
-    model = UNET(in_channels=1, outchannels=K, sngp=True, rff_dim=128).to(device)
+    model = UNET(in_channels=3, outchannels=K, sngp=True, rff_dim=128).to(device)
 
     # Forward (logits only)
     with torch.no_grad():
