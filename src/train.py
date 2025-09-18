@@ -13,8 +13,8 @@ import matplotlib.pyplot as plt
 from model_sngp import UNET
 LEARNING_RATE = 1E-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE = 4
-NUM_EPOCHS = 100
+BATCH_SIZE = 16
+NUM_EPOCHS = 400
 NUM_WORKERS = 2
 IMAGE_HEIGHT = 512
 IMAGE_WIDTH = 512
