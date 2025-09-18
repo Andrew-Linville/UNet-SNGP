@@ -1,5 +1,5 @@
-# UNet + SNGP (Spectral-normalized features + Random Fourier Features GP head, binary segmentation)
-# Drop this file into your project and import UNET, predict_with_uncertainty.
+# UNet + SNGP (Spectral-normalized features + Random Fourier Features GP head)
+# Supports N output channels (binary or multiclass). Mean-field uncertainty per channel.
 
 import math
 import torch
@@ -12,10 +12,14 @@ import torch.nn.utils as nn_utils
 # Spectral-normalized conv helpers
 # -----------------------------
 def sn_conv(in_ch, out_ch, k=3, s=1, p=1, bias=False):
-    return nn_utils.spectral_norm(nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=p, bias=bias))
+    return nn_utils.spectral_norm(
+        nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=p, bias=bias)
+    )
 
 def sn_tconv(in_ch, out_ch, k=2, s=2, bias=False):
-    return nn_utils.spectral_norm(nn.ConvTranspose2d(in_ch, out_ch, kernel_size=k, stride=s, bias=bias))
+    return nn_utils.spectral_norm(
+        nn.ConvTranspose2d(in_ch, out_ch, kernel_size=k, stride=s, bias=bias)
+    )
 
 
 # -----------------------------
@@ -60,72 +64,92 @@ class RFF2d(nn.Module):
 
 
 # -----------------------------
-# GP Head (binary) + Laplace precision
+# GP Head (multiclass) + Laplace precision (per-class diagonal-block approx)
 # -----------------------------
-class GPHeadBinary(nn.Module):
+class GPHeadMulti(nn.Module):
     """
-    - Trains beta with standard BCEWithLogits.
+    - Trains beta with standard CE/BCE loss (included in model parameters).
     - After training, call:
         head.reset_precision(tau)
         then iterate over training data (no grad):
         logits, Z = model.forward_with_features(img)
-        head.accumulate_precision_binary(Z, logits.view(-1,1))
-    - At inference, use variance_from_Z(Z) for σ^2 per pixel (BHW,1).
+        head.accumulate_precision(Z, logits)
+      For K>1, this uses a diagonal-block Laplace approx:
+        Σ_inv[k] += Z^T diag(p_k(1-p_k)) Z    (ignores cross-class blocks)
+    - At inference, use variance_from_Z(Z) to get σ^2 per class (N,K) in logit space.
     """
-    def __init__(self, in_ch, rff_dim=128, rff_scale=1.0):
+    def __init__(self, in_ch, num_classes, rff_dim=128, rff_scale=1.0):
         super().__init__()
+        self.num_classes = int(num_classes)
         self.rff = RFF2d(in_ch, rff_dim=rff_dim, scale=rff_scale)
-        self.beta = nn.Parameter(torch.zeros(rff_dim, 1))  # learned linear weights
-        self.register_buffer("Sigma_inv", torch.eye(rff_dim))  # filled later by reset_precision/accumulate
+        self.beta = nn.Parameter(torch.zeros(rff_dim, self.num_classes))  # (M,K)
+        # Per-class precision matrices Σ_inv[k] (K, M, M)
+        self.register_buffer("Sigma_inv", torch.eye(rff_dim).unsqueeze(0).repeat(self.num_classes, 1, 1))
 
     def forward_logits_and_z(self, feat):
-        Z, (B, H, W) = self.rff(feat)           # Z: (BHW,M)
-        logits_vec = Z @ self.beta              # (BHW,1)
-        logits = logits_vec.view(B, H, W, 1).permute(0, 3, 1, 2)  # (B,1,H,W)
+        Z, (B, H, W) = self.rff(feat)            # Z: (BHW,M)
+        logits_vec = Z @ self.beta               # (BHW,K)
+        logits = logits_vec.view(B, H, W, self.num_classes).permute(0, 3, 1, 2)  # (B,K,H,W)
         return logits, Z
 
     def reset_precision(self, tau=1e-3):
-        M = self.Sigma_inv.shape[0]
-        self.Sigma_inv = torch.eye(M, device=self.beta.device) * float(tau)
+        K, M, _ = self.Sigma_inv.shape
+        self.Sigma_inv = torch.eye(M, device=self.beta.device).mul(float(tau)).unsqueeze(0).repeat(K, 1, 1)
 
     @torch.no_grad()
-    def accumulate_precision_binary(self, Z, logits):
+    def accumulate_precision(self, Z, logits):
         """
         Z: (N,M) flattened features for a batch (N = B*H*W)
-        logits: (N,1) raw logits
-        Σ_inv += Z^T diag(p(1-p)) Z
+        logits: (B,K,H,W) or (N,K) raw logits
+        Update per-class precision: Σ_inv[k] += Z^T diag(p_k (1 - p_k)) Z
         """
-        p = torch.sigmoid(logits).flatten()                 # (N,)
-        w = (p * (1 - p)).clamp_min(1e-6)                  # stability clamp
-        Zw = Z * w.sqrt().unsqueeze(1)                     # (N,M)
-        self.Sigma_inv += Zw.T @ Zw                        # rank-N update
+        if logits.dim() == 4:
+            B, K, H, W = logits.shape
+            logits_vec = logits.permute(0, 2, 3, 1).reshape(-1, K)  # (N,K)
+        else:
+            logits_vec = logits  # (N,K)
+
+        if self.num_classes == 1:
+            p = torch.sigmoid(logits_vec)                      # (N,1)
+            w = (p * (1 - p)).clamp_min(1e-6)                 # (N,1)
+            Zw = Z * w.sqrt()                                  # (N,M)
+            self.Sigma_inv[0] += Zw.T @ Zw
+            return
+
+        p = torch.softmax(logits_vec, dim=1)  # (N,K)
+        # Diagonal-block approx: ignore off-diagonal Fisher terms
+        for k in range(self.num_classes):
+            wk = (p[:, k] * (1.0 - p[:, k])).clamp_min(1e-6)  # (N,)
+            Zw = Z * wk.sqrt().unsqueeze(1)                   # (N,M)
+            self.Sigma_inv[k] += Zw.T @ Zw
 
     @torch.no_grad()
     def variance_from_Z(self, Z):
         """
-        σ^2 = diag( Z Σ Z^T ), where Σ = (Σ_inv)^{-1}.
-        Compute via Cholesky solves; no explicit inverse.
-        Returns (N,1).
+        For each class k, σ_k^2 = diag( Z Σ_k Z^T ), Σ_k = (Σ_inv[k])^{-1}
+        Returns: sigma2 (N, K)
         """
-        L = torch.linalg.cholesky(self.Sigma_inv)          # (M,M)
-        V = torch.cholesky_solve(Z.T, L)                   # (M,N), solves Σ_inv * V = Z^T
-        sigma2 = (Z * V.T).sum(dim=1, keepdim=True)        # (N,1)
-        return sigma2
+        N = Z.shape[0]
+        K, M, _ = self.Sigma_inv.shape
+        sigma2 = Z.new_zeros((N, K))
+        for k in range(K):
+            Lk = torch.linalg.cholesky(self.Sigma_inv[k])   # (M,M)
+            Vk = torch.cholesky_solve(Z.T, Lk)              # (M,N)
+            sigma2[:, k] = (Z * Vk.T).sum(dim=1)            # (N,)
+        return sigma2  # (N,K)
 
 
 # -----------------------------
-# UNet with optional SNGP head
+# UNet with optional SNGP head (supports outchannels = K >= 1)
 # -----------------------------
 class UNET(nn.Module):
     """
-    If sngp=True: replaces final 1x1 conv with SNGP GP head (binary).
+    If sngp=True: replaces final 1x1 conv with SNGP GP head (N classes).
     If sngp=False: behaves like a normal UNet with 1x1 final conv.
     """
-    def __init__(self, in_channels=3, outchannels=1, features=(64, 128, 256, 512),
+    def __init__(self, in_channels=3, outchannels=2, features=(64, 128, 256, 512),
                  sngp=True, rff_dim=128, rff_scale=1.0):
         super().__init__()
-        assert outchannels == 1 or not sngp, "This code path implements SNGP for binary (outchannels=1)."
-
         self.sngp = bool(sngp)
         self.outchannels = int(outchannels)
 
@@ -145,9 +169,10 @@ class UNET(nn.Module):
             self.ups.append(DoubleConv(f * 2, f))
 
         if self.sngp:
-            self.gp_head = GPHeadBinary(in_ch=features[0], rff_dim=rff_dim, rff_scale=rff_scale)
+            self.gp_head = GPHeadMulti(in_ch=features[0], num_classes=self.outchannels,
+                                       rff_dim=rff_dim, rff_scale=rff_scale)
         else:
-            self.final_conv = nn.Conv2d(features[0], outchannels, kernel_size=1)
+            self.final_conv = nn.Conv2d(features[0], self.outchannels, kernel_size=1)
 
     # ---- shared decode pass returning (B, features[0], H, W) ----
     def _decode(self, x):
@@ -170,7 +195,7 @@ class UNET(nn.Module):
     def forward(self, x):
         x = self._decode(x)
         if self.sngp:
-            logits, _ = self.gp_head.forward_logits_and_z(x)  # (B,1,H,W)
+            logits, _ = self.gp_head.forward_logits_and_z(x)  # (B,K,H,W)
             return logits
         else:
             return self.final_conv(x)
@@ -180,49 +205,60 @@ class UNET(nn.Module):
         x = self._decode(x)
         if not self.sngp:
             raise RuntimeError("forward_with_features requires sngp=True.")
-        return self.gp_head.forward_logits_and_z(x)  # (B,1,H,W), (BHW,M)
+        return self.gp_head.forward_logits_and_z(x)  # (B,K,H,W), (BHW,M)
 
 
 # -----------------------------
-# Inference helper: prob + variance (binary, mean-field)
+# Inference helper: prob + variance (mean-field)
+#  - For K=1: sigmoid( μ / sqrt(1+λσ²) )
+#  - For K>1: softmax( μ_k / sqrt(1+λσ_k²) ) across k
 # -----------------------------
 @torch.no_grad()
-def predict_with_uncertainty(model: UNET, img: torch.Tensor):
+def predict_with_uncertainty(model: UNET, img: torch.Tensor, lambda_mf: float = math.pi/8.0):
     """
     Returns:
-      probs  : (B,1,H,W) mean-field calibrated probabilities
-      sigma2 : (B,1,H,W) predictive variance in logit space
-      logits : (B,1,H,W) raw logits (μ)
+      probs  : (B,K,H,W) mean-field calibrated probabilities
+      sigma2 : (B,K,H,W) predictive variance in logit space (per class)
+      logits : (B,K,H,W) raw logits (μ)
     """
     assert model.sngp, "predict_with_uncertainty() requires a UNET with sngp=True."
     model.eval()
-    logits, Z = model.forward_with_features(img)          # logits: (B,1,H,W), Z:(BHW,M)
-    sigma2 = model.gp_head.variance_from_Z(Z)             # (BHW,1)
-    B, _, H, W = logits.shape
-    sigma2 = sigma2.view(B, 1, H, W)
-    probs = torch.sigmoid(logits / torch.sqrt(1.0 + (math.pi / 8.0) * sigma2))
+    logits, Z = model.forward_with_features(img)                  # logits: (B,K,H,W), Z:(BHW,M)
+    B, K, H, W = logits.shape
+    sigma2_vec = model.gp_head.variance_from_Z(Z)                 # (N,K), N=BHW
+    sigma2 = sigma2_vec.view(B, H, W, K).permute(0, 3, 1, 2)      # (B,K,H,W)
+
+    denom = torch.sqrt(1.0 + lambda_mf * sigma2)                  # (B,K,H,W)
+    logits_adj = logits / denom
+
+    if K == 1:
+        probs = torch.sigmoid(logits_adj)
+    else:
+        probs = torch.softmax(logits_adj, dim=1)
+
     return probs, sigma2, logits
 
 
 # -----------------------------
-# Quick sanity test
+# Quick sanity test (K=2)
 # -----------------------------
 def _test():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     x = torch.randn(2, 1, 160, 160, device=device)
-    model = UNET(in_channels=1, outchannels=1, sngp=True, rff_dim=128).to(device)
+    K = 2
+    model = UNET(in_channels=1, outchannels=K, sngp=True, rff_dim=128).to(device)
 
     # Forward (logits only)
     with torch.no_grad():
         logits = model(x)
-        print("logits:", logits.shape)  # (2,1,160,160)
+        print("logits:", logits.shape)  # (2,K,160,160)
 
     # Build precision with a fake pass over random data
     model.eval()
     model.gp_head.reset_precision(tau=1e-3)
     with torch.no_grad():
         logits, Z = model.forward_with_features(x)
-        model.gp_head.accumulate_precision_binary(Z, logits.view(-1, 1))
+        model.gp_head.accumulate_precision(Z, logits)
 
     # Predict with uncertainty
     with torch.no_grad():
@@ -232,4 +268,3 @@ def _test():
 
 if __name__ == "__main__":
     _test()
-

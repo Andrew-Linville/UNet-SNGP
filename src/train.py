@@ -4,12 +4,13 @@ from albumentations.pytorch import ToTensorV2
 from tqdm import tqdm
 import torch.nn as nn
 import torch.optim as optim
-from model import UNET
 from utils import load_checkpoint, save_checkpoint, get_loaders, check_accuracy, save_predictions_as_imgs
 from pathlib import Path
 from custom_loss import BCEDiceLoss
 import matplotlib.pyplot as plt
 
+# from model import UNET
+from model_sngp import UNET
 LEARNING_RATE = 1E-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 4
@@ -175,15 +176,15 @@ def main():
         train_loss = train_fn(train_loader, model, optimizer, loss_fn, scaler)
         train_losses.append(train_loss)
         # Only saves every 10 times (speeds up training)
-        # if (epoch+1) % 10 == 0: 
-        checkpoint = {
-            "state_dict": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-        }
-        save_checkpoint(checkpoint)
-        
-        val_loss = check_accuracy(val_loader, model, loss_fn, device=DEVICE)
-        val_losses.append(val_loss)
+        if (epoch+1) % 10 == 0: 
+            checkpoint = {
+                "state_dict": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+            }
+            save_checkpoint(checkpoint)
+            
+            val_loss = check_accuracy(val_loader, model, loss_fn, device=DEVICE)
+            val_losses.append(val_loss)
         
 
         
