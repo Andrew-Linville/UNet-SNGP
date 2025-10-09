@@ -116,7 +116,7 @@ class GPHeadMulti(nn.Module):
             self.Sigma_inv[0] += Zw.T @ Zw
             return
 
-        p = torch.softmax(logits_vec, dim=1)  # (N,K)
+        p = torch.sigmoid(logits_vec, dim=1)  # (N,K)
         # Diagonal-block approx: ignore off-diagonal Fisher terms
         for k in range(self.num_classes):
             wk = (p[:, k] * (1.0 - p[:, k])).clamp_min(1e-6)  # (N,)
@@ -234,7 +234,7 @@ def predict_with_uncertainty(model: UNET, img: torch.Tensor, lambda_mf: float = 
     if K == 1:
         probs = torch.sigmoid(logits_adj)
     else:
-        probs = torch.softmax(logits_adj, dim=1)
+        probs = torch.sigmoid(logits_adj, dim=1)
 
     return probs, sigma2, logits
 
