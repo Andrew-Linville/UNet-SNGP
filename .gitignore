@@ -12,6 +12,9 @@ losses.csv/
 val_channel_masks/
 val_mask_overlays/
 val_variance_maps/
+val_mask_overlays_1
+val_channel_masks_1
+val_variance_maps_1
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
