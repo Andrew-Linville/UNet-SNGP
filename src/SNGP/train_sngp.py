@@ -11,33 +11,36 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from torch.utils.tensorboard import SummaryWriter
 
-from model_sngp import UNET_SNGP
+from SNGP.model_sngp import UNET_SNGP
 
+from custom_loss import BCEDiceLossSNGP
 
-from utils_sngp import (
+from SNGP.utils_sngp import (
     load_checkpoint,
     save_checkpoint,
     get_loaders,
-    check_accuracy,
-    log_val_preds_tb,
-    uncert_map_TB,
+    check_accuracy_multilabel,
+    log_val_preds_tb_multilabel,
+    uncert_map_TB_multilabel,
 )
 
 
 # Config / Arguments
 
 p = argparse.ArgumentParser()
+p.add_argument("run_name", nargs="?", default=None, help="Optional run name (ignored by code; used by SLURM script).")
 p.add_argument("--logdir", default=None)
-p.add_argument("--epochs", type=int, default=10)
+p.add_argument("--epochs", type=int, default=400)
 p.add_argument("--lr", type=float, default=1e-4)
 p.add_argument("--batch_size", type=int, default=64)
-p.add_argument("--img_h", type=int, default=160)
+p.add_argument("--img_h", type=int, default=240)
 p.add_argument("--img_w", type=int, default=240)
 p.add_argument("--ridge", type=float, default=1.0)
 p.add_argument("--rff_dim", type=int, default=512)
 p.add_argument("--reduction_dim", type=int, default=64)
 p.add_argument("--chunk_pixels", type=int, default=8192)
 p.add_argument("--load_ckpt", action="store_true")
+p.add_argument("--loss_func", type=str, default="BCEDice")
 args = p.parse_args()
 
 RUN_DIR = Path(args.logdir or "runs/sngp_default")
@@ -48,13 +51,32 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PIN_MEMORY = True
 NUM_WORKERS = 4
 
-TRAIN_IMG_DIR = "data/train_images/"
-TRAIN_MASK_DIR = "data/train_masks/"
-VAL_IMG_DIR   = "data/val_images/"
-VAL_MASK_DIR  = "data/val_masks/"
+TRAIN_IMG_DIR = "data/train/imgs"
+TRAIN_MASK_DIR = "data/train/masks"
+VAL_IMG_DIR   = "data/val/imgs"
+VAL_MASK_DIR  = "data/val/masks"
 
 
 # Train utils
+
+def _to_multilabel_targets(y):
+    """
+    Coerce y to float [B,2,H,W] for multi-label BCE.
+    Accepts: [B,2,H,W] (one-hot or multi-hot), [B,1,2,H,W], [B,H,W] (binary -> broadcast),
+             [B,1,H,W] (single channel -> broadcast or raise).
+    """
+    if y.ndim == 5 and y.shape[2] == 2:         # [B,1,2,H,W]
+        y = y[:, 0, ...]                        # -> [B,2,H,W]
+    elif y.ndim == 4 and y.shape[1] == 2:       # [B,2,H,W]
+        pass
+    elif y.ndim == 4 and y.shape[1] == 1:       # [B,1,H,W] -> duplicate to 2 chans (if both labels share same mask)
+        y = y.repeat(1, 2, 1, 1)
+    elif y.ndim == 3:                            # [B,H,W] -> duplicate to 2 chans
+        y = y.unsqueeze(1).repeat(1, 2, 1, 1)
+    else:
+        raise ValueError(f"Unexpected target shape: {tuple(y.shape)}")
+    return y.float()
+
 
 def _only_logits(out):
     return out[0] if isinstance(out, (tuple, list)) else out
@@ -70,8 +92,9 @@ def train_epoch(loader, model, opt, loss_fn, scaler):
     loop = tqdm(loader)
     for x, y in loop:
         x = x.to(DEVICE, non_blocking=True)
-        y = y.float().unsqueeze(1).to(DEVICE, non_blocking=True)
-
+        # y = y.float().unsqueeze(1).to(DEVICE, non_blocking=True)
+        # y = _to_class_indices(y).to(DEVICE, non_blocking=True)
+        y = _to_multilabel_targets(y).to(DEVICE, non_blocking=True)
         with torch.cuda.amp.autocast(enabled=(DEVICE.type == "cuda")):
             out = model(x)
             logits = _only_logits(out)
@@ -93,7 +116,9 @@ def eval_loss(loader, model, loss_fn):
     total, n = 0.0, 0
     for x, y in loader:
         x = x.to(DEVICE, non_blocking=True)
-        y = y.float().unsqueeze(1).to(DEVICE, non_blocking=True)
+        # y = y.float().unsqueeze(1).to(DEVICE, non_blocking=True)
+        # y = _to_class_indices(y).to(DEVICE, non_blocking=True)
+        y = _to_multilabel_targets(y).to(DEVICE, non_blocking=True)
         with torch.cuda.amp.autocast(enabled=(DEVICE.type == "cuda")):
             out = model(x)
             logits = _only_logits(out)
@@ -103,6 +128,27 @@ def eval_loss(loader, model, loss_fn):
     return total / max(1, n)
 
 # Main 
+def choose_loss(loss_type):
+    
+    if loss_type=="BCEDice":
+        print(f"Using {loss_type} loss")
+        loss_fn = BCEDiceLossSNGP()
+        return loss_fn
+    
+    elif loss_type == "BCE":
+        print(f"Using {loss_type} loss")
+        return nn.BCEWithLogitsLoss() # Use for single class
+    
+    elif loss_type == "CE":
+        print(f"Using {loss_type} loss")
+        return nn.CrossEntropyLoss() # use for multi class
+    
+    else:
+        print("Not valid loss function")
+        return None
+        
+    
+    
 
 def main():
     train_tf = A.Compose([
@@ -121,7 +167,7 @@ def main():
 
     model = UNET_SNGP(
         in_channels=3,
-        num_classes=1,
+        num_classes=2,
         features=(64,128,256,512),
         reduction_dim=args.reduction_dim,
         rff_dim=args.rff_dim,
@@ -132,7 +178,9 @@ def main():
         chunk_pixels=args.chunk_pixels,
     ).to(DEVICE)
 
-    loss_fn = nn.BCEWithLogitsLoss()
+    # Choose the loss function
+    loss_fn = choose_loss(args.loss_func)
+    
     opt = optim.Adam(model.parameters(), lr=args.lr)
     scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE.type == "cuda"))
 
@@ -150,9 +198,9 @@ def main():
     # Initial metrics
     epoch0 = 0
     set_variance(model, False)
-    dice0, acc0 = check_accuracy(val_loader, model, epoch0, device=DEVICE.type)
+    dice0, acc0 = check_accuracy_multilabel(val_loader, model, epoch0, device=DEVICE.type)
     writer.add_scalars("accuracies", {"dice": dice0, "accuracy": acc0}, epoch0)
-    log_val_preds_tb(val_loader, model, writer, epoch0, DEVICE.type)
+    log_val_preds_tb_multilabel(val_loader, model, writer, epoch0, DEVICE.type, max_batches=2, samples_per_batch=10)
 
     tr0 = eval_loss(train_loader, model, loss_fn)
     vl0 = eval_loss(val_loader, model, loss_fn)
@@ -166,13 +214,13 @@ def main():
 
         # metrics
         set_variance(model, False)
-        dice, acc = check_accuracy(val_loader, model, ep, device=DEVICE.type)
+        dice, acc = check_accuracy_multilabel(val_loader, model, ep, device=DEVICE.type)
         writer.add_scalars("accuracies", {"dice": dice, "accuracy": acc}, ep)
 
         if ep % 10 == 0:
             save_checkpoint({"state_dict": model.state_dict(), "optimizer": opt.state_dict()}, run_dir=RUN_DIR)
 
-        log_val_preds_tb(val_loader, model, writer, ep, DEVICE.type)
+        log_val_preds_tb_multilabel(val_loader, model, writer, ep, DEVICE.type, max_batches=2, samples_per_batch=10)
 
     # 
     # Final one-pass precision build
@@ -195,8 +243,8 @@ def main():
     set_variance(model, True)  # returns (logits, var_map)
 
     # visualize uncertainty with your TB helper
-    log_val_preds_tb(val_loader, model, writer, args.epochs + 1, DEVICE.type)
-    uncert_map_TB(val_loader, model, writer, 10, DEVICE)
+    log_val_preds_tb_multilabel(val_loader, model, writer, args.epochs + 1, DEVICE.type, max_batches=8)
+    uncert_map_TB_multilabel(val_loader, model, writer, 10, DEVICE)
 
 if __name__ == "__main__":
     main()

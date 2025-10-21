@@ -9,16 +9,16 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:1
-#SBATCH --output=/home/andrew03/pythonRepos/UNet-Cars/logs/%x_%j.out
-#SBATCH --error=/home/andrew03/pythonRepos/UNet-Cars/logs/%x_%j.err
-#SBATCH --chdir=/home/andrew03/pythonRepos/UNet-Cars
+#SBATCH --output=/home/andrew03/pythonRepos/UNet-SNGP/logs/%x_%j.out
+#SBATCH --error=/home/andrew03/pythonRepos/UNet-SNGP/logs/%x_%j.err
+#SBATCH --chdir=/home/andrew03/pythonRepos/UNet-SNGP
 
 set -euo pipefail
 
 # --- Environment ---
 module reset
 module load Python/3.11.3-GCCcore-12.3.0
-source /home/andrew03/pythonRepos/UNet-Cars/arc_venvs/unet_311_a30_normal_q/bin/activate
+source /home/andrew03/pythonRepos/UNet-SNGP/arc_venvs/unet_311_a30_normal_q/bin/activate
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK}
@@ -40,7 +40,7 @@ export RUN_TAG
 
 # --- TensorBoard setup (runs on the compute node) ---
 : "${TB_PORT:=6006}"                                        # override via: sbatch --export=ALL,TB_PORT=16006 ...
-: "${TB_LOGROOT:=$HOME/pythonRepos/UNet-Cars/runs}"         # parent directory for runs
+: "${TB_LOGROOT:=$HOME/pythonRepos/UNet-SNGP/runs}"         # parent directory for runs
 TB_LOGDIR="${TB_LOGROOT}/${RUN_TAG}"
 mkdir -p "$TB_LOGDIR"
 
@@ -75,7 +75,10 @@ http://localhost:${LOCAL_PORT}
 EOF
 
 # --- Training ---
-python -u src/train_sngp.py --logdir "$TB_LOGDIR"
+python -u src/SNGP/train_sngp.py --logdir "$TB_LOGDIR" "$@"
 
 # Keep TB alive until job ends (training may exit first)
 wait $TB_PID || true
+
+
+# 

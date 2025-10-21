@@ -2,6 +2,7 @@ import os
 from PIL import Image
 from torch.utils.data import Dataset
 import numpy as np
+from pathlib import Path
 
 class singleClass(Dataset):
     def __init__(self, image_dir, mask_dir, transform=None):
@@ -42,6 +43,7 @@ class fillerDataset(Dataset):
         # Get the masks for each class
         class_folder_dir = []
         class_mask_lists = []
+        mask_dir = Path(mask_dir) 
         for seg_class in classes:
             class_mask_dir = mask_dir / seg_class
             class_folder_dir.append(class_mask_dir)

@@ -1,3 +1,6 @@
+# 
+# ! Need to make edits. This is from previous implementation
+# 
 # save_as: run_multilabel_infer_and_save.py
 # Inference on **validation set only** for UNet + SNGP (multilabel by default)
 # - Loads SNGP-enabled UNet + checkpoint
@@ -22,7 +25,7 @@ from collections import OrderedDict
 
 # ==== IMPORT YOUR MODEL ====
 # Ensure this imports the **SNGP-enabled** UNET (sngp=True supported, gp_head present).
-from model_sngp import UNET  # change if your class lives elsewhere
+from src.SNGP.model_sngp import UNET  # change if your class lives elsewhere
 
 
 # ----------------------------

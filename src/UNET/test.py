@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
-from model import UNET  # adjust import if your UNet lives elsewhere
+from src.UNET.model import UNET  # adjust import if your UNet lives elsewhere
 
 
 # ----------------------------

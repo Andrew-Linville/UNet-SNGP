@@ -4,13 +4,15 @@ from albumentations.pytorch import ToTensorV2
 from tqdm import tqdm
 import torch.nn as nn
 import torch.optim as optim
-from utils import load_checkpoint, save_checkpoint, get_loaders, check_accuracy, save_predictions_as_imgs
+from src.UNET.utils import load_checkpoint, save_checkpoint, get_loaders, check_accuracy, save_predictions_as_imgs
 from pathlib import Path
 from custom_loss import BCEDiceLoss
 import matplotlib.pyplot as plt
 
 # from model import UNET
-from model_sngp import UNET
+from src.SNGP.model_sngp import UNET
+from custom_loss import 
+
 LEARNING_RATE = 1E-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 8
